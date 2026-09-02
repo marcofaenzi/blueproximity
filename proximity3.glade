@@ -1251,6 +1251,7 @@
                     <property name="has_entry">True</property>
                     <items>
                       <item translatable="yes">loginctl lock-session</item>
+                      <item translatable="yes">qdbus6 org.freedesktop.ScreenSaver /ScreenSaver Lock</item>
                       <item>gnome-screensaver-command -l xscreensaver-command -l</item>
                     </items>
                     <signal name="changed" handler="on_settings_changed" swapped="no"/>
@@ -1275,7 +1276,8 @@
                     <property name="active">0</property>
                     <property name="has_entry">True</property>
                     <items>
-                      <item id="&lt;Enter ID&gt;" translatable="yes">loginctl unlock-session</item>
+                      <item translatable="yes">loginctl unlock-session</item>
+                      <item translatable="yes">qdbus6 org.freedesktop.ScreenSaver /ScreenSaver SetActive false</item>
                       <item>gnome-screensaver-command -d xscreensaver-command -d</item>
                     </items>
                     <signal name="changed" handler="on_settings_changed" swapped="no"/>
@@ -1301,6 +1303,7 @@
                     <property name="active">0</property>
                     <property name="has_entry">True</property>
                     <items>
+                      <item translatable="yes">qdbus6 org.freedesktop.ScreenSaver /ScreenSaver SimulateUserActivity</item>
                       <item translatable="yes">xset dpms force on</item>
                       <item>gnome-screensaver-command -p xscreensaver-command -p</item>
                     </items>

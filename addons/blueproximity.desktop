@@ -8,5 +8,5 @@ Exec=/usr/bin/blueproximity
 Icon[de_DE]=/usr/share/pixmaps/blueproximity.xpm
 Name=BlueProximity
 Icon=/usr/share/pixmaps/blueproximity.xpm
-Categories=Application;Utility;
+Categories=Utility;Security;
 StartupNotify=false

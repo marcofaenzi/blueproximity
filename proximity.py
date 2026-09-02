@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-SW_VERSION = '1.3.3'
+SW_VERSION = '1.4.6'
 
 # Add security to your desktop by automatically locking and unlocking 
 # the screen when you and your phone leave/enter the desk. 
 # Think of a proximity detector for your mobile phone via bluetooth.
-# requires external bluetooth util hcitool to run
-# (which makes it unix only at this time)
+# Uses hcitool for RSSI when available (BlueZ RFCOMM connection required).
 
 # Needed python extensions:
 #  ConfigObj (python3-configobj)
@@ -23,9 +22,7 @@ SW_VERSION = '1.3.3'
 
 APP_NAME = "blueproximity"
 
-# This value gives us the base directory for language files and icons.
-# Set this value to './' for local folder version
-# or, for instance, to '/usr/share/blueproximity/' for packaged version
+# Base directory for language files and icons (auto-detected from script location).
 dist_path = './'
 
 # Translation stuff
@@ -43,9 +40,13 @@ import time
 # blueproximity
 import struct
 
-# Get the local directory since we are not installing anything
+# Resolve install path from script location or current working directory.
 if dist_path == './':
-    dist_path = os.getcwd() + '/'
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.isfile(os.path.join(_script_dir, 'proximity3.glade')):
+        dist_path = _script_dir + '/'
+    else:
+        dist_path = os.getcwd() + '/'
 
 # Init the list of languages to support
 local_path = dist_path + 'LANG/'
@@ -98,15 +99,25 @@ except:
     print(_(" sudo apt-get install python3-gobject"))
     sys.exit(1)
 
+TRAY_BACKEND = None
+AppIndicator = None
+XApp = None
+
 try:
-    gi.require_version('XApp', '1.0')
-    from gi.repository import XApp
-except:
-    print(_("The program cannot import the module XApp."))
-    print(_("Please make sure the GI bindings for XApp are installed."))
-    print(_("e.g. with Ubuntu Linux, type"))
-    print(_(" sudo apt-get install gir1.2-xapp-1.0"))
-    sys.exit(1)
+    gi.require_version('AyatanaAppIndicator3', '0.1')
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+    TRAY_BACKEND = 'ayatana'
+except Exception:
+    try:
+        gi.require_version('XApp', '1.0')
+        from gi.repository import XApp
+        TRAY_BACKEND = 'xapp'
+    except Exception:
+        print(_("The program cannot import a system tray module."))
+        print(_("Please install Ayatana AppIndicator (recommended on Plasma 6) or XApp:"))
+        print(_(" sudo apt-get install gir1.2-ayatanaappindicator3-0.1"))
+        print(_(" sudo apt-get install gir1.2-xapp-1.0"))
+        sys.exit(1)
 
 try:
     from configobj import ConfigObj
@@ -177,6 +188,30 @@ except:
     print(_(" sudo apt-get install python3-gi"))
     sys.exit(1)
 
+def get_default_commands():
+    """Return lock/unlock/proximity shell commands suited to the current desktop."""
+    desktop = os.environ.get('XDG_CURRENT_DESKTOP', '').upper()
+    if 'KDE' in desktop:
+        return (
+            'loginctl lock-session',
+            'loginctl unlock-session',
+            'qdbus6 org.freedesktop.ScreenSaver /ScreenSaver SimulateUserActivity',
+        )
+    return (
+        'loginctl lock-session',
+        'loginctl unlock-session',
+        '',
+    )
+
+
+_default_lock, _default_unlock, _default_proximity = get_default_commands()
+_default_log_file = os.path.join(os.getenv('HOME'), '.blueproximity', 'blueproximity.log')
+
+
+def _conf_string_default(value):
+    return "string(default=''" + value.replace("'", "''") + "'')"
+
+
 # Setup config file specs and defaults
 # This is the ConfigObj's syntax
 conf_specs = [
@@ -186,15 +221,16 @@ conf_specs = [
     'lock_duration=integer(0,120,default=6)',
     'unlock_distance=integer(0,127,default=4)',
     'unlock_duration=integer(0,120,default=1)',
-    'lock_command=string(default=''gnome-screensaver-command -l'')',
-    'unlock_command=string(default=''gnome-screensaver-command -d'')',
-    'proximity_command=string(default=''gnome-screensaver-command -p'')',
+    'lock_command=' + _conf_string_default(_default_lock),
+    'unlock_command=' + _conf_string_default(_default_unlock),
+    'proximity_command=' + _conf_string_default(_default_proximity),
     'proximity_interval=integer(5,600,default=60)',
     'buffer_size=integer(1,255,default=1)',
+    'debug_log=boolean(default=True)',
     'log_to_syslog=boolean(default=True)',
     'log_syslog_facility=string(default=''local7'')',
-    'log_to_file=boolean(default=False)',
-    'log_filelog_filename=string(default=''' + os.getenv('HOME') + '/blueproximity.log'')'
+    'log_to_file=boolean(default=True)',
+    'log_filelog_filename=' + _conf_string_default(_default_log_file),
 ]
 
 # The icon used at normal operation and in the info dialog.
@@ -213,6 +249,67 @@ icon_pause = 'blueproximity_pause.svg'
 # called in specifically! I thought it might have been part of the bluetooth library, but it wasn't. Then I found it
 # in a similar BT program at:
 # https://www.programcreek.com/python/example/92269/bluetooth._bluetooth.hci_filter_all_events
+def _list_bluetooth_devices():
+    """Return [[mac, name], ...] using BlueZ D-Bus, bluetoothctl, and inquiry scan."""
+    ret_tab = []
+    seen = set()
+
+    def add_device(mac, name):
+        mac = str(mac).strip()
+        if not mac or mac in seen:
+            return
+        seen.add(mac)
+        ret_tab.append([mac, str(name or '')])
+
+    try:
+        import dbus
+        bus = dbus.SystemBus()
+        manager = dbus.Interface(
+            bus.get_object('org.bluez', '/'),
+            'org.freedesktop.DBus.ObjectManager',
+        )
+        for interfaces in manager.GetManagedObjects().values():
+            if 'org.bluez.Device1' not in interfaces:
+                continue
+            props = interfaces['org.bluez.Device1']
+            add_device(
+                props.get('Address', ''),
+                props.get('Alias') or props.get('Name') or '',
+            )
+    except Exception:
+        pass
+
+    if not ret_tab:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['bluetoothctl', 'devices'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            for line in result.stdout.splitlines():
+                parts = line.split(' ', 2)
+                if len(parts) >= 3 and parts[0] == 'Device':
+                    add_device(parts[1], parts[2])
+        except Exception:
+            pass
+
+    try:
+        for bdaddr in bluetooth.discover_devices(duration=8, lookup_names=True, flush_cache=True):
+            name = ''
+            try:
+                name = bluetooth.lookup_name(bdaddr) or ''
+            except Exception:
+                pass
+            add_device(bdaddr, name)
+    except Exception:
+        pass
+
+    ret_tab.sort(key=lambda entry: (entry[1] or entry[0]).lower())
+    return ret_tab
+
+
 def printpacket(pkt):
     for c in pkt:
         sys.stdout.write("%02x " % struct.unpack("B", c)[0])
@@ -325,17 +422,22 @@ class ProximityGUI(object):
         if show_window_on_start:
             self.window.show()
 
-        # Prepare icon
-        self.icon = XApp.StatusIcon()
-        self.icon.set_tooltip_text(_("BlueProximity starting..."))
-        self.icon.set_icon_name(dist_path + icon_error)
-
-        # self.icon.connect('activate', self.showWindow)
-        # self.icon.connect('popup-menu', self.popupMenu, self.popupmenu)
-        self.icon.connect('button-release-event', self.make_popupmenu)
-        # self.icon.popup_menu(self.popupmenu, 0, 0, 0, 0, 0)
-
-        self.icon.set_visible(True)
+        # Prepare system tray icon (Ayatana on Plasma 6, XApp fallback)
+        self.tray_menu = self._build_tray_menu()
+        if TRAY_BACKEND == 'ayatana':
+            self.icon = AppIndicator.Indicator.new(
+                'blueproximity',
+                dist_path + icon_error,
+                AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+            )
+            self.icon.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+            self.icon.set_menu(self.tray_menu)
+            self._set_tray_icon(icon_error, _("BlueProximity starting..."))
+        else:
+            self.icon = XApp.StatusIcon()
+            self._set_tray_icon(icon_error, _("BlueProximity starting..."))
+            self.icon.connect('button-release-event', self.make_popupmenu)
+            self.icon.set_visible(True)
 
         # now the control may fire change events
         self.gone_live = True
@@ -344,31 +446,50 @@ class ProximityGUI(object):
             config[2].logger.log_line(_('started.'))
 
         # Setup the popup menu and associated callbacks
+
+    def _build_tray_menu(self):
+        popupmenu = gtk.Menu()
+        menuItem = gtk.ImageMenuItem.new_from_stock(stock_id=gtk.STOCK_PREFERENCES)
+        menuItem.connect('activate', self.showWindow)
+        popupmenu.append(menuItem)
+        menuItem = gtk.ImageMenuItem.new_from_stock(stock_id=gtk.STOCK_MEDIA_PAUSE)
+        menuItem.connect('activate', self.pausePressed)
+        popupmenu.append(menuItem)
+        menuItem = gtk.ImageMenuItem.new_from_stock(stock_id=gtk.STOCK_ABOUT)
+        menuItem.connect('activate', self.aboutPressed)
+        popupmenu.append(menuItem)
+        menuItem = gtk.SeparatorMenuItem()
+        popupmenu.append(menuItem)
+        menuItem = gtk.ImageMenuItem.new_from_stock(stock_id=gtk.STOCK_QUIT)
+        menuItem.connect('activate', self.quit)
+        popupmenu.append(menuItem)
+        popupmenu.show_all()
+        return popupmenu
+
+    def _set_tray_icon(self, icon_file, tooltip):
+        icon_path = dist_path + icon_file
+        if TRAY_BACKEND == 'ayatana':
+            self.icon.set_icon_full(icon_path, tooltip)
+            self.icon.set_title(tooltip)
+        else:
+            self.icon.set_icon_name(icon_path)
+            self.icon.set_tooltip_text(tooltip)
+
+    def _message_dialog(self, message, message_type=gtk.MessageType.ERROR,
+                        buttons=gtk.ButtonsType.OK):
+        return gtk.MessageDialog(
+            transient_for=self.window,
+            flags=gtk.DialogFlags.MODAL,
+            message_type=message_type,
+            buttons=buttons,
+            text=message,
+        )
+
     def make_popupmenu(self, first, second, third, button, event_time, unknown):
         if button == 1:
             self.showWindow(self.icon)
         if button == 3:
-            self.popupmenu = gtk.Menu()
-            menuItem = gtk.ImageMenuItem.new_from_stock(stock_id=gtk.STOCK_PREFERENCES)
-            menuItem.connect('activate', self.showWindow)
-            self.popupmenu.append(menuItem)
-            menuItem = gtk.ImageMenuItem.new_from_stock(stock_id=gtk.STOCK_MEDIA_PAUSE)
-            menuItem.connect('activate', self.pausePressed)
-            self.popupmenu.append(menuItem)
-            menuItem = gtk.ImageMenuItem.new_from_stock(stock_id=gtk.STOCK_ABOUT)
-            menuItem.connect('activate', self.aboutPressed)
-            self.popupmenu.append(menuItem)
-            # menuItem = gtk.MenuItem()
-            menuItem = gtk.SeparatorMenuItem()
-            self.popupmenu.append(menuItem)
-            menuItem = gtk.ImageMenuItem.new_from_stock(stock_id=gtk.STOCK_QUIT)
-            menuItem.connect('activate', self.quit)
-            self.popupmenu.append(menuItem)
-            # params = "params are:\nfirst:{0}\nsecond:{1}\nthird:{2}\nbutton:{3}\nevent_time:{4}\nunknown:{5}"
-            # params = params.format(first, second, third, button, event_time, unknown)
-            # print(repr(params))
-            self.popupmenu.show_all()
-            self.popupmenu.popup(None, None, None, 3, button, event_time)
+            self.tray_menu.popup_at_pointer(None)
 
     # Callback to just close and not destroy the rename config window
     def dlgRenameCancel_clicked(self, widget, data=None):
@@ -377,11 +498,10 @@ class ProximityGUI(object):
 
     # Callback to rename a config file.
     def dlgRenameDo_clicked(self, widget, data=None):
-        newconfig = self.wTree.get_widget("entryRenameName").get_text()
+        newconfig = self.wTree.get_object("entryRenameName").get_text()
         # check if something has been entered
         if newconfig == '':
-            dlg = gtk.MessageDialog(None, gtk.DIALOG_MODAL, gtk.MESSAGE_ERROR, gtk.BUTTONS_OK,
-                                    _("You must enter a name for the configuration."))
+            dlg = self._message_dialog(_("You must enter a name for the configuration."))
             dlg.run()
             dlg.destroy()
             return 0
@@ -389,8 +509,8 @@ class ProximityGUI(object):
         newname = os.path.join(os.getenv('HOME'), '.blueproximity', newconfig + ".conf")
         try:
             os.stat(newname)
-            dlg = gtk.MessageDialog(None, gtk.DIALOG_MODAL, gtk.MESSAGE_ERROR, gtk.BUTTONS_OK,
-                                    _("A configuration file with the name '%s' already exists.") % newname)
+            dlg = self._message_dialog(
+                _("A configuration file with the name '%s' already exists.") % newname)
             dlg.run()
             dlg.destroy()
             return 0
@@ -431,12 +551,11 @@ class ProximityGUI(object):
 
     # Callback to create a config file.
     def dlgNewDo_clicked(self, widget, data=None):
-        newconfig = self.wTree.get_widget("entryNewName").get_text()
+        newconfig = self.wTree.get_object("entryNewName").get_text()
 
         # check if something has been entered
         if (newconfig == ''):
-            dlg = gtk.MessageDialog(None, gtk.DIALOG_MODAL, gtk.MESSAGE_ERROR, gtk.BUTTONS_OK,
-                                    _("You must enter a name for the new configuration."))
+            dlg = self._message_dialog(_("You must enter a name for the new configuration."))
             dlg.run()
             dlg.destroy()
             return 0
@@ -446,8 +565,8 @@ class ProximityGUI(object):
 
         try:
             os.stat(newname)
-            dlg = gtk.MessageDialog(None, gtk.DIALOG_MODAL, gtk.MESSAGE_ERROR, gtk.BUTTONS_OK,
-                                    _("A configuration file with the name '%s' already exists.") % newname)
+            dlg = self._message_dialog(
+                _("A configuration file with the name '%s' already exists.") % newname)
             dlg.run()
             dlg.destroy()
             return 0
@@ -555,15 +674,17 @@ class ProximityGUI(object):
 
         # never delete the last config
         if len(self.configs) == 1:
-            dlg = gtk.MessageDialog(None, gtk.DialogFlags.MODAL, gtk.MessageType.ERROR, gtk.ButtonsType.OK,
-                                    _("The last configuration file cannot be deleted."))
+            dlg = self._message_dialog(_("The last configuration file cannot be deleted."))
             dlg.run()
             dlg.destroy()
             return 0
 
         # security question
-        dlg = gtk.MessageDialog(None, gtk.DIALOG_MODAL, gtk.MESSAGE_ERROR, gtk.BUTTONS_YES_NO,
-                                _("Do you really want to delete the configuration '%s'.") % self.configname)
+        dlg = self._message_dialog(
+            _("Do you really want to delete the configuration '%s'.") % self.configname,
+            message_type=gtk.MessageType.QUESTION,
+            buttons=gtk.ButtonsType.YES_NO,
+        )
         retval = dlg.run()
         dlg.destroy()
         if retval == gtk.RESPONSE_YES:
@@ -607,7 +728,7 @@ class ProximityGUI(object):
         if button == 3:
             if data:
                 data.show_all()
-                data.popup(None, None, None, 3, button, event_time)
+                data.popup_at_pointer(None)
         pass
 
     # Callback to show and hide the config dialog.
@@ -806,10 +927,6 @@ class ProximityGUI(object):
         if tree_iter is not None:
             value = model.get_value(tree_iter, 0)
             self.wTree.get_object("entryChannel").set_value(int(value))
-            entry_channel_value = self.wTree.get_object("entryChannel").get_value()
-            print('tree_iter is: {0}\n\n'
-                  'Also, repr(tree_iter) is: {1}\n\n'
-                  'And entryChannel value is: {2}\n\n'.format(tree_iter, repr(tree_iter), entry_channel_value))
             self.writeSettings()
 
     # Callback to just close and not destroy the main window
@@ -827,8 +944,16 @@ class ProximityGUI(object):
         model, selection_iter = selection.get_selected()
         if (selection_iter):
             mac = self.model.get_value(selection_iter, 0)
-            self.wTree.get_widget("entryMAC").set_text(mac)
+            self.wTree.get_object("entryMAC").set_text(mac)
             self.writeSettings()
+
+    def _set_window_cursor(self, cursor):
+        try:
+            gdk_window = self.window.get_window()
+            if gdk_window:
+                gdk_window.set_cursor(cursor)
+        except Exception:
+            pass
 
     # Callback that is executed when the scan for devices button is clicked
     # actually it starts the scanning asynchronously to have the gui redraw nicely before hanging :-)
@@ -837,7 +962,7 @@ class ProximityGUI(object):
         # scan the area for bluetooth devices and show the results
         from gi.repository import Gdk as gdk
         watch = gdk.Cursor(gdk.CursorType.WATCH)
-        self.window.get_screen().get_root_window().set_cursor(watch)
+        self._set_window_cursor(watch)
         self.model.clear()
         self.model.append(['...', _('Now scanning...')])
         self.setSensitiveConfigManagement(False)
@@ -852,15 +977,16 @@ class ProximityGUI(object):
         macs = []
         try:
             macs = self.proxi.get_device_list()
-        except:
-            macs = [['', _('Sorry, the bluetooth device is busy connecting.\n'
-                           'Please enter a correct mac address or no address at all\n'
-                           'for the config that is not connecting and try again later.')]]
+        except Exception as exc:
+            macs = [['', _('Scan failed: %s') % exc]]
         self.proxi.dev_mac = tmpMac
         self.model.clear()
-        for mac in macs:
-            self.model.append([mac[0], mac[1]])
-        self.window.get_screen().get_root_window().set_cursor(None)
+        if macs:
+            for mac in macs:
+                self.model.append([mac[0], mac[1]])
+        else:
+            self.model.append(['', _('No Bluetooth devices found. Check that Bluetooth is enabled and your phone is paired.')])
+        self._set_window_cursor(None)
         self.setSensitiveConfigManagement(True)
 
     # Callback that is executed when the scan channels button is clicked.
@@ -871,7 +997,7 @@ class ProximityGUI(object):
         # scan the selected device for possibly usable channels
         if self.scanningChannels:
             self.wTree.get_object("labelBtnScanChannel").set_label(_("Sca_n channels on device"))
-            self.wTree.get_object("channelScanWindow").hide_all()
+            self.wTree.get_object("channelScanWindow").hide()
             self.scanningChannels = False
             self.scanner.doStop()
             self.setSensitiveConfigManagement(True)
@@ -885,15 +1011,17 @@ class ProximityGUI(object):
                 self.pausePressed(None)
                 was_paused = False
             self.wTree.get_object("labelBtnScanChannel").set_label(_("Stop sca_nning"))
-            self.wTree.get_object("channelScanWindow").show_all()
+            self.wTree.get_object("channelScanWindow").show()
             self.scanningChannels = True
-            dialog = gtk.MessageDialog(text=_("The scanning process tries to connect to each of "
-                                              "the 30 possible ports. This will take some time and "
-                                              "you should watch your bluetooth device for any actions "
-                                              "to be taken. If possible click on accept/connect. If you "
-                                              "are asked for a pin your device was not paired properly before, "
-                                              "see the manual on how to fix this."),
-                                       buttons=gtk.ButtonsType.OK)
+            dialog = self._message_dialog(
+                _("The scanning process tries to connect to each of "
+                  "the 30 possible ports. This will take some time and "
+                  "you should watch your bluetooth device for any actions "
+                  "to be taken. If possible click on accept/connect. If you "
+                  "are asked for a pin your device was not paired properly before, "
+                  "see the manual on how to fix this."),
+                message_type=gtk.MessageType.INFO,
+            )
             dialog.connect("response", lambda x, y: dialog.destroy())
             dialog.run()
             self.scanner = ScanDevice(mac, self.modelScan, was_paused, self.btnScanChannel_done)
@@ -950,8 +1078,7 @@ class ProximityGUI(object):
         if self.pauseMode:
             from gi.repository import GdkPixbuf
             # GdkPixbuf.Pixbuf.new_from_file(dist_path + icon_pause)
-            self.icon.set_icon_name(dist_path + icon_pause)
-            self.icon.set_tooltip_text(_('Pause Mode - not connected'))
+            self._set_tray_icon(icon_pause, _('Pause Mode - not connected'))
         else:
 
             # we have to show the 'worst case' since we only have one icon but many configs...
@@ -977,8 +1104,7 @@ class ProximityGUI(object):
                 simu = _('\nSimulation Mode (locking disabled)')
             else:
                 simu = ''
-            self.icon.set_icon_name(dist_path + con_icons[connection_state])
-            self.icon.set_tooltip_text(con_info + '\n' + simu)
+            self._set_tray_icon(con_icons[connection_state], con_info + '\n' + simu)
         # print("self.proxi.Simulate is: {}".format(self.proxi.Simulate))
         from gi.repository import GLib as glib
         self.timer = glib.timeout_add(1000, self.updateState)
@@ -1068,8 +1194,12 @@ class Logger(object):
             try:
                 self.flog.write(time.ctime() + " blueproximity: " + line + "\n")
                 self.flog.flush()
-            except:
+            except Exception:
                 self.disable_filelogging()
+
+    def debug_line(self, config, line):
+        if config.get('debug_log', True):
+            self.log_line('[debug] ' + line)
 
     # Activate the logging mechanism that are requested by the given configuration.
     # @param config A ConfigObj object containing the needed settings.
@@ -1173,13 +1303,9 @@ class Proximity(threading.Thread):
         self.timeGone = 0
         self.timeProx = 0
 
-    # Returns all active bluetooth devices found. This is a blocking call.
+    # Returns known and nearby bluetooth devices. This is a blocking call.
     def get_device_list(self):
-        ret_tab = list()
-        nearby_devices = bluetooth.discover_devices()
-        for bdaddr in nearby_devices:
-            ret_tab.append([str(bdaddr), str(bluetooth.lookup_name(bdaddr))])
-        return ret_tab
+        return _list_bluetooth_devices()
 
     # Kills the rssi detection connection.
     def kill_connection(self):
@@ -1243,12 +1369,22 @@ class Proximity(threading.Thread):
     # @param dev_mac mac address of the device to check.
     # This should also be removed but I still have to find a way to read the rssi value from python
     def get_proximity_once(self, dev_mac):
-        ret_val = os.popen("hcitool rssi " + dev_mac + " 2>/dev/null").readlines()
-        if ret_val == []:
-            ret_val = -255
-        else:
-            ret_val = ret_val[0].split(':')[1].strip(' ')
-        return int(ret_val)
+        import shutil
+        import subprocess
+
+        if shutil.which('hcitool'):
+            try:
+                result = subprocess.run(
+                    ['hcitool', 'rssi', dev_mac],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                if result.returncode == 0 and ':' in result.stdout:
+                    return int(result.stdout.split(':')[1].strip())
+            except (subprocess.TimeoutExpired, ValueError, IndexError):
+                pass
+        return -255
 
     # Fire up an rfcomm connection to a certain device on the given channel.
     # Don't forget to set up your phone not to ask for a connection.
@@ -1279,6 +1415,44 @@ class Proximity(threading.Thread):
             self.get_connection(dev_mac, dev_channel)
         return int(ret_val / self.ringbuffer_size)
 
+    def _run_action_command(self, command, action_name):
+        import subprocess
+
+        command = str(command or '').strip()
+        if not command:
+            self.logger.debug_line(self.config, _('Skipping %s: empty command') % action_name)
+            return
+
+        self.logger.debug_line(
+            self.config, _('Running %s command: %s') % (action_name, command))
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            output = (result.stdout + result.stderr).strip()
+            self.logger.debug_line(
+                self.config,
+                _('%s finished with exit code %d%s') % (
+                    action_name,
+                    result.returncode,
+                    (': ' + output) if output else '',
+                ),
+            )
+            if result.returncode != 0:
+                self.ErrorMsg = _('%s command failed (exit %d): %s') % (
+                    action_name, result.returncode, output or command)
+        except subprocess.TimeoutExpired:
+            self.logger.debug_line(self.config, _('%s command timed out') % action_name)
+            self.ErrorMsg = _('%s command timed out') % action_name
+        except Exception as exc:
+            self.logger.debug_line(
+                self.config, _('%s command error: %s') % (action_name, exc))
+            self.ErrorMsg = str(exc)
+
     def go_active(self):
         # The Doctor is in
         if self.ignoreFirstTransition:
@@ -1287,7 +1461,7 @@ class Proximity(threading.Thread):
             self.logger.log_line(_('screen is unlocked'))
             if self.timeAct == 0:
                 self.timeAct = time.time()
-                ret_val = os.popen(self.config['unlock_command']).readlines()
+                self._run_action_command(self.config['unlock_command'], _('unlock'))
                 self.timeAct = 0
             else:
                 self.logger.log_line(
@@ -1304,7 +1478,7 @@ class Proximity(threading.Thread):
             self.logger.log_line(_('screen is locked'))
             if self.timeGone == 0:
                 self.timeGone = time.time()
-                ret_val = os.popen(self.config['lock_command']).readlines()
+                self._run_action_command(self.config['lock_command'], _('lock'))
                 self.timeGone = 0
             else:
                 self.logger.log_line(
@@ -1317,7 +1491,7 @@ class Proximity(threading.Thread):
         # The Doctor is still in
         if self.timeProx == 0:
             self.timeProx = time.time()
-            ret_val = os.popen(self.config['proximity_command']).readlines()
+            self._run_action_command(self.config['proximity_command'], _('proximity'))
             self.timeProx = 0
         else:
             self.logger.log_line(
@@ -1369,8 +1543,11 @@ class Proximity(threading.Thread):
                         duration_count = 0
                         proxiCmdCounter = proxiCmdCounter + 1
                 if dist != self.Dist or state != self.State:
-                    # print "Detected distance atm: " + str(dist) + "; state is " + state
-                    pass
+                    self.logger.debug_line(
+                        self.config,
+                        _('distance=%d state=%s limits lock<=%d unlock>=%d') % (
+                            dist, state, self.gone_limit, self.active_limit),
+                    )
                 self.State = state
                 self.Dist = dist
                 # let's handle the proximity command

@@ -35,17 +35,30 @@ understandable and hey - it even got some pretty pictures in there
 too :-)
 
 ## Installation
-Note from the maintainer of this fork (RGM):
->For the moment, this application hasn't been packaged for installation as a .deb or .rpm.
-If you know how to do it, please reach out and I'll include such packages!
 
-### Arch Linux Package (maintained by: [Laurent OF Fough](https://github.com/LaurentFough))
-+ AUR Package available here: [AUR/ blueproximity-py3-git](https://aur.archlinux.org/packages/blueproximity-py3-git/)
+### Ubuntu 26.04 LTS (Plasma 6 / Wayland)
 
-#### Installation via yay|trizen, etc: (_* Package is marked as conflicting with the Python2 version, to avoid having both installed_)
-- > `$ yay -S blueproximity-py3-git`
+Build and install the Debian package from source:
 
-## Development setup
+```sh
+sudo apt install debhelper dh-python python3-all python3-configobj
+cd blueproximity
+dpkg-buildpackage -us -uc -b
+sudo apt install ../blueproximity_1.4.0-1_all.deb
+```
+
+Runtime dependencies (installed automatically with the package):
+
+```sh
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
+  python3-configobj python3-bluez bluez qdbus-qt6
+```
+
+On Plasma 6 the default lock/unlock commands use the freedesktop ScreenSaver
+D-Bus interface via `qdbus6`. Pair your phone via Bluetooth and configure its
+MAC address in the BlueProximity settings window.
+
+### Development setup
 
 Create a virtual environment for Python 3.8 and install the 
 required libraries using the requirements.txt file.
@@ -67,6 +80,7 @@ proximity.py script.
 
 ## Release History
 
+* 1.4.0 Plasma 6 / Wayland compatibility, Ayatana tray icon, Debian packaging
 * 1.3.3 Bug fixes
 * 1.3.2 Fixed README.md (this file) mistake
 * 1.3.1 Bug fix
@@ -119,7 +133,7 @@ Here's a list on contributors to the source:
 See [https://dbader.org/blog/write-a-great-readme-for-your-github-project](https://dbader.org/blog/write-a-great-readme-for-your-github-project)
 
 <!-- Markdown link & img dfn's -->
-[python-image]: https://img.shields.io/badge/python-3.8-blue
+[python-image]: https://img.shields.io/badge/python-3.8+-blue
 [python-url]: https://www.python.org/downloads/release/python-370/
 [github-downloads-image]: https://img.shields.io/badge/Download%20from-GitHub-orange
 [github-downloads-url]: https://github.com/doctortoffu/Event-Info-Bot
